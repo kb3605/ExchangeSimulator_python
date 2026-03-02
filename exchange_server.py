@@ -100,6 +100,11 @@ class ExchangeServer:
         self._order_expiry_time: Dict[int, float] = {}  # order_id -> expiry timestamp
         self._order_remaining_lock = threading.Lock()
 
+        # Track the most recent historical (logical) timestamp used in UDP broadcasts.
+        # Used by _expire_order so expired-order DELETE events use historical time,
+        # not wall-clock time, preventing corruption of clients' exchange-time tracking.
+        self._current_exchange_time: float = 0.0
+
         # Shutdown coordination
         self._running = False
 
@@ -326,7 +331,9 @@ class ExchangeServer:
         remainder = order.size
         total_executed = 0
         fill_responses = []  # Track fills at each price level
-        current_time = get_time_of_day()
+        current_time = order.logical_time if order.logical_time is not None else get_time_of_day()
+        if order.logical_time is not None and order.logical_time > self._current_exchange_time:
+            self._current_exchange_time = order.logical_time
 
         # Walk the opposite side until filled or no liquidity
         while remainder > 0:
@@ -414,7 +421,9 @@ class ExchangeServer:
     def _process_limit_order(self, conn_id: int, order: LiveOrder) -> str:
         """Process a limit order."""
         order_id = self._state.get_next_order_id()
-        current_time = get_time_of_day()
+        current_time = order.logical_time if order.logical_time is not None else get_time_of_day()
+        if order.logical_time is not None and order.logical_time > self._current_exchange_time:
+            self._current_exchange_time = order.logical_time
 
         # Record order ownership
         self._state.record_order(order_id, order.user, conn_id)
@@ -584,7 +593,9 @@ class ExchangeServer:
     def _process_cancel_order(self, conn_id: int, cancel: CancelOrder) -> str:
         """Process a cancel order request."""
         order_id = cancel.order_id
-        current_time = get_time_of_day()
+        current_time = cancel.logical_time if cancel.logical_time is not None else get_time_of_day()
+        if cancel.logical_time is not None and cancel.logical_time > self._current_exchange_time:
+            self._current_exchange_time = cancel.logical_time
 
         with self._order_remaining_lock:
             # Check if order exists and get its details
@@ -661,7 +672,9 @@ class ExchangeServer:
         price/size. The order gets a new order_id (loses queue priority).
         """
         old_order_id = modify.order_id
-        current_time = get_time_of_day()
+        current_time = modify.logical_time if modify.logical_time is not None else get_time_of_day()
+        if modify.logical_time is not None and modify.logical_time > self._current_exchange_time:
+            self._current_exchange_time = modify.logical_time
 
         with self._order_remaining_lock:
             # Check if order exists
@@ -887,9 +900,13 @@ class ExchangeServer:
             conn_id = self._state.get_connection(order_id)
             self._state.remove_order(order_id)
 
-        # Broadcast DELETE on UDP market data so book builders see the expiry
+        # Broadcast DELETE on UDP market data so book builders see the expiry.
+        # Use the most recent historical logical time so clients' exchange-time
+        # tracking is not polluted by wall-clock values.
         if self._market_data_server:
-            current_time = get_time_of_day()
+            current_time = (self._current_exchange_time
+                            if self._current_exchange_time > 0
+                            else get_time_of_day())
             self._market_data_server.broadcast_delete(
                 time=current_time,
                 order_id=order_id,

@@ -20,6 +20,8 @@ import sys
 import time
 from typing import Dict, Optional, Tuple
 
+_ORDER_TTL = 86400  # 24 hours — orders should outlast any replay session
+
 try:
     from .lobster_reader import LOBSTERReader, LOBSTERMessage, format_time, format_price
 except ImportError:
@@ -164,7 +166,7 @@ class HistoricalOrderClient:
         # Use a single consistent user for all orders
         user = "lobster_replay"
 
-        order_str = f"limit,{msg.size},{msg.price},{side},{user}"
+        order_str = f"limit,{msg.size},{msg.price},{side},{user},{_ORDER_TTL},{msg.time}"
         response = self._send_and_receive(order_str)
 
         exchange_order_id, was_fill = self._parse_ack_response(response)
@@ -201,7 +203,7 @@ class HistoricalOrderClient:
         user = "lobster_replay"
 
         # Cancel the existing order
-        cancel_str = f"cancel,{exchange_order_id},{user}"
+        cancel_str = f"cancel,{exchange_order_id},{user},{msg.time}"
         response = self._send_and_receive(cancel_str)
 
         if not response.startswith('CANCEL_ACK'):
@@ -221,7 +223,7 @@ class HistoricalOrderClient:
 
         if new_size > 0:
             # Submit new order with remaining size
-            order_str = f"limit,{new_size},{price},{side},{user}"
+            order_str = f"limit,{new_size},{price},{side},{user},{_ORDER_TTL},{msg.time}"
             response = self._send_and_receive(order_str)
 
             new_exchange_id, was_fill = self._parse_ack_response(response)
@@ -252,7 +254,7 @@ class HistoricalOrderClient:
         exchange_order_id, _, _, _ = self._order_map[msg.order_id]
         user = "lobster_replay"
 
-        cancel_str = f"cancel,{exchange_order_id},{user}"
+        cancel_str = f"cancel,{exchange_order_id},{user},{msg.time}"
         response = self._send_and_receive(cancel_str)
 
         if response.startswith('CANCEL_ACK'):
@@ -291,7 +293,7 @@ class HistoricalOrderClient:
         user = "lobster_replay"
 
         # Send the aggressor market order
-        market_str = f"market,{msg.size},0,{aggressor_side},{user}"
+        market_str = f"market,{msg.size},0,{aggressor_side},{user},0,{msg.time}"
         response = self._send_and_receive(market_str)
 
         # Check for rejection (e.g. empty book)
@@ -303,13 +305,13 @@ class HistoricalOrderClient:
             # Fall back to cancel if market order rejected
             if msg.order_id in self._order_map:
                 exchange_order_id, old_size, price, side = self._order_map[msg.order_id]
-                cancel_str = f"cancel,{exchange_order_id},{user}"
+                cancel_str = f"cancel,{exchange_order_id},{user},{msg.time}"
                 cancel_resp = self._send_and_receive(cancel_str)
                 if cancel_resp.startswith('CANCEL_ACK'):
                     self.cancels_sent += 1
                     new_size = old_size - msg.size
                     if new_size > 0:
-                        resubmit = f"limit,{new_size},{price},{side},{user}"
+                        resubmit = f"limit,{new_size},{price},{side},{user},{_ORDER_TTL},{msg.time}"
                         resp = self._send_and_receive(resubmit)
                         new_id, was_fill = self._parse_ack_response(resp)
                         if new_id is not None:
@@ -339,18 +341,18 @@ class HistoricalOrderClient:
             new_size = old_size - msg.size
             if new_size <= 0:
                 # Fully consumed — cancel any remainder from exchange
-                cancel_str = f"cancel,{exchange_order_id},{user}"
+                cancel_str = f"cancel,{exchange_order_id},{user},{msg.time}"
                 resp = self._send_and_receive(cancel_str)
                 if resp.startswith('CANCEL_ACK'):
                     self.cancels_sent += 1
                 del self._order_map[msg.order_id]
             else:
                 # Partially consumed — cancel and resubmit with new size
-                cancel_str = f"cancel,{exchange_order_id},{user}"
+                cancel_str = f"cancel,{exchange_order_id},{user},{msg.time}"
                 resp = self._send_and_receive(cancel_str)
                 if resp.startswith('CANCEL_ACK'):
                     self.cancels_sent += 1
-                    resubmit = f"limit,{new_size},{price},{side},{user}"
+                    resubmit = f"limit,{new_size},{price},{side},{user},{_ORDER_TTL},{msg.time}"
                     resp = self._send_and_receive(resubmit)
                     new_id, was_fill = self._parse_ack_response(resp)
                     if new_id is not None:

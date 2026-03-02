@@ -86,6 +86,7 @@ class LiveOrder:
     side: str  # 'B' or 'S'
     user: str
     ttl: int = DEFAULT_TTL_SECONDS  # Time-to-live in seconds
+    logical_time: Optional[float] = None  # Historical exchange time (seconds since midnight)
 
 
 @dataclass
@@ -93,6 +94,7 @@ class CancelOrder:
     """Cancel order request from a live client."""
     order_id: int
     user: str
+    logical_time: Optional[float] = None  # Historical exchange time (seconds since midnight)
 
 
 @dataclass
@@ -102,6 +104,7 @@ class ModifyOrder:
     size: int
     price: int
     user: str
+    logical_time: Optional[float] = None
 
 
 @dataclass
@@ -150,16 +153,18 @@ def parse_live_order(input_str: str) -> Optional[LiveOrder]:
     """
     Parse a live order string.
 
-    Format: orderType,size,price,side,user[,ttl]
+    Format: orderType,size,price,side,user[,ttl[,logical_time]]
     Example: limit,100,58000000,B,trader1
-    Example: limit,100,58000000,B,trader1,60   (60 second TTL)
+    Example: limit,100,58000000,B,trader1,60              (60 second TTL)
+    Example: limit,100,58000000,B,trader1,60,37800.5      (with historical timestamp)
+    Example: market,100,0,B,trader1,0,37800.5             (market order with timestamp; ttl=0 ok)
     """
     input_str = input_str.strip()
     if not input_str:
         return None
 
     parts = input_str.split(',')
-    if len(parts) not in (5, 6):
+    if len(parts) not in (5, 6, 7):
         return None
 
     order_type = parts[0].strip().lower()
@@ -191,12 +196,21 @@ def parse_live_order(input_str: str) -> Optional[LiveOrder]:
         return None
 
     # Parse optional TTL (default: DEFAULT_TTL_SECONDS)
+    # ttl=0 is allowed for market orders (they execute immediately; TTL is irrelevant)
     ttl = DEFAULT_TTL_SECONDS
-    if len(parts) == 6:
+    if len(parts) >= 6:
         try:
             ttl = int(parts[5].strip())
-            if ttl <= 0:
+            if ttl < 0 or (ttl == 0 and order_type == "limit"):
                 return None
+        except ValueError:
+            return None
+
+    # Parse optional logical_time (historical exchange timestamp, seconds since midnight)
+    logical_time = None
+    if len(parts) == 7:
+        try:
+            logical_time = float(parts[6].strip())
         except ValueError:
             return None
 
@@ -206,7 +220,8 @@ def parse_live_order(input_str: str) -> Optional[LiveOrder]:
         price=price,
         side=side,
         user=user,
-        ttl=ttl
+        ttl=ttl,
+        logical_time=logical_time,
     )
 
 
@@ -214,15 +229,16 @@ def parse_modify_order(input_str: str) -> Optional[ModifyOrder]:
     """
     Parse a modify order string.
 
-    Format: modify,order_id,size,price,user
+    Format: modify,order_id,size,price,user[,logical_time]
     Example: modify,1000,200,50000000,trader1
+    Example: modify,1000,200,50000000,trader1,37800.5   (with historical timestamp)
     """
     input_str = input_str.strip()
     if not input_str:
         return None
 
     parts = input_str.split(',')
-    if len(parts) != 5:
+    if len(parts) not in (5, 6):
         return None
 
     order_type = parts[0].strip().lower()
@@ -254,22 +270,31 @@ def parse_modify_order(input_str: str) -> Optional[ModifyOrder]:
     if not user:
         return None
 
-    return ModifyOrder(order_id=order_id, size=size, price=price, user=user)
+    logical_time = None
+    if len(parts) == 6:
+        try:
+            logical_time = float(parts[5].strip())
+        except ValueError:
+            return None
+
+    return ModifyOrder(order_id=order_id, size=size, price=price, user=user,
+                       logical_time=logical_time)
 
 
 def parse_cancel_order(input_str: str) -> Optional[CancelOrder]:
     """
     Parse a cancel order string.
 
-    Format: cancel,order_id,user
+    Format: cancel,order_id,user[,logical_time]
     Example: cancel,1000,trader1
+    Example: cancel,1000,trader1,37800.5   (with historical timestamp)
     """
     input_str = input_str.strip()
     if not input_str:
         return None
 
     parts = input_str.split(',')
-    if len(parts) != 3:
+    if len(parts) not in (3, 4):
         return None
 
     order_type = parts[0].strip().lower()
@@ -285,7 +310,14 @@ def parse_cancel_order(input_str: str) -> Optional[CancelOrder]:
     if not user:
         return None
 
-    return CancelOrder(order_id=order_id, user=user)
+    logical_time = None
+    if len(parts) == 4:
+        try:
+            logical_time = float(parts[3].strip())
+        except ValueError:
+            return None
+
+    return CancelOrder(order_id=order_id, user=user, logical_time=logical_time)
 
 
 def parse_lobster_line(line: str) -> Optional[EventLOBSTER]:

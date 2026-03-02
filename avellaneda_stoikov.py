@@ -33,6 +33,7 @@ from typing import List, Optional
 
 from order_client_with_fsm_with_md import OrderClientWithFSMAndMarketData, BBO
 from order_client_with_fsm import ManagedOrder, ExchangeMessage
+from order_fsm_final import OrderEvent
 from messages import DEFAULT_TTL_SECONDS
 
 TICK_SIZE = 100       # $0.01 in LOBSTER format
@@ -163,6 +164,7 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
 
     def __init__(self, host='localhost', order_port=10000, md_port=10002,
                  gamma=0.01, k=20.0, k_auto=False, k_min=5.0, horizon=300.0,
+                 tau_fixed: Optional[float] = None,
                  sigma_window=100,
                  max_inventory=500, order_size=100, min_requote=0.1,
                  warmup=5.0,
@@ -176,6 +178,7 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
         self._k = k
         self._k_auto = k_auto
         self._horizon = horizon
+        self._tau_fixed = tau_fixed  # if set, τ is pinned to this value (stationary mode)
         self._sigma_window = sigma_window
         self._max_inventory = max_inventory
         self._order_size = order_size
@@ -217,6 +220,10 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
         self._fills: List[FillRecord] = []
         self._data_lock = threading.Lock()
 
+        # Exchange time tracking (from LOBSTER message timestamps)
+        self._exchange_time: float = 0.0   # latest exchange timestamp (seconds since midnight)
+        self._exchange_t0: float = 0.0     # first exchange timestamp seen
+
         # Stats
         self._n_fills = 0
         self._n_requotes = 0
@@ -239,19 +246,61 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
         # so it is safe to call here from the MD callback thread.
         if (new_bbo.ask_price is not None
                 and self._bid_order is not None and self._bid_order.is_live
+                and not self._bid_order.pending_cancel
+                and not self._bid_order.pending_modify
                 and self._bid_order.price >= new_bbo.ask_price):
+            ltime = self._exchange_time if self._exchange_time != 0.0 else None
             if self._verbose:
                 print(f"[PROTECT] bid ${self._bid_order.price/PRICE_SCALE:.2f}"
-                      f" >= ask ${new_bbo.ask_price/PRICE_SCALE:.2f} — cancelling")
-            self.cancel_order(self._bid_order)
+                      f" >= ask ${new_bbo.ask_price/PRICE_SCALE:.2f}"
+                      f" — cancel eid={self._bid_order.exchange_order_id}")
+            self.cancel_order(self._bid_order, logical_time=ltime)
 
         if (new_bbo.bid_price is not None
                 and self._ask_order is not None and self._ask_order.is_live
+                and not self._ask_order.pending_cancel
+                and not self._ask_order.pending_modify
                 and self._ask_order.price <= new_bbo.bid_price):
             if self._verbose:
                 print(f"[PROTECT] ask ${self._ask_order.price/PRICE_SCALE:.2f}"
                       f" <= bid ${new_bbo.bid_price/PRICE_SCALE:.2f} — cancelling")
-            self.cancel_order(self._ask_order)
+            ltime = self._exchange_time if self._exchange_time != 0.0 else None
+            self.cancel_order(self._ask_order, logical_time=ltime)
+
+        # Lone-quote protection: if the BBO just moved to our resting price and
+        # we appear to be the only size there, cancel immediately.  The tell is
+        # that the old BBO had a better price on that side (we were behind the
+        # market) and the new BBO is at our price with size <= our order size
+        # (all other liquidity at that level has gone).  We filter out our own
+        # size by checking ask_size <= our size rather than ask_size == 0.
+        ltime = self._exchange_time if self._exchange_time != 0.0 else None
+        if (self._ask_order is not None and self._ask_order.is_live
+                and not self._ask_order.pending_modify
+                and not self._ask_order.pending_cancel
+                and new_bbo.ask_price is not None and new_bbo.ask_size is not None
+                and new_bbo.ask_price == self._ask_order.price
+                and new_bbo.ask_size <= self._ask_order.size
+                and old_bbo.ask_price is not None
+                and old_bbo.ask_price < self._ask_order.price):
+            if self._verbose:
+                print(f"[PULL] ask ${self._ask_order.price/PRICE_SCALE:.2f} exposed alone"
+                      f" (book={new_bbo.ask_size} <= ours={self._ask_order.size})")
+            self.cancel_order(self._ask_order, logical_time=ltime)
+            # Do NOT clear _ask_order — wait for CANCEL_ACK to drive is_live=False,
+            # then _update_quotes_locked will resubmit naturally.
+
+        if (self._bid_order is not None and self._bid_order.is_live
+                and not self._bid_order.pending_modify
+                and not self._bid_order.pending_cancel
+                and new_bbo.bid_price is not None and new_bbo.bid_size is not None
+                and new_bbo.bid_price == self._bid_order.price
+                and new_bbo.bid_size <= self._bid_order.size
+                and old_bbo.bid_price is not None
+                and old_bbo.bid_price > self._bid_order.price):
+            if self._verbose:
+                print(f"[PULL] bid ${self._bid_order.price/PRICE_SCALE:.2f} exposed alone"
+                      f" (book={new_bbo.bid_size} <= ours={self._bid_order.size})")
+            self.cancel_order(self._bid_order, logical_time=ltime)
 
         # Sample mid for sigma at fixed intervals to filter microstructure noise
         if now - self._last_sigma_sample_time >= self._sigma_sample_interval:
@@ -278,8 +327,18 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
     def on_market_data(self, lobster_line: str) -> None:
         """Hook called for every raw LOBSTER line from the market-data feed.
 
-        Estimates k from total message rate when --k-auto is enabled.
+        Tracks exchange time from LOBSTER timestamps; estimates k from total
+        message rate when --k-auto is enabled.
         """
+        # Extract exchange timestamp from the first LOBSTER field
+        try:
+            ts = float(lobster_line.split(',')[0])
+            if self._exchange_t0 == 0.0:
+                self._exchange_t0 = ts
+            self._exchange_time = ts
+        except (ValueError, IndexError):
+            pass
+
         if not self._k_auto:
             return
 
@@ -342,11 +401,14 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
         s = mid / PRICE_SCALE  # to dollars
 
         now = time.time()
-        elapsed = now - self._session_start
-        tau = max(self._horizon - elapsed, 1.0)
-        if elapsed >= self._horizon:
-            self._session_start = now
-            tau = self._horizon
+        if self._tau_fixed is not None:
+            tau = self._tau_fixed
+        else:
+            elapsed = now - self._session_start
+            tau = max(self._horizon - elapsed, 1.0)
+            if elapsed >= self._horizon:
+                self._session_start = now
+                tau = self._horizon
 
         with self._state_lock:
             q = self._inventory
@@ -433,18 +495,42 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
         self._last_requote_time = time.time()
         self._n_requotes += 1
 
+        # Safety clamp: maintain a two-tick buffer between our quotes and the
+        # opposite BBO.  A one-tick buffer (bid < ask) is insufficient: after
+        # PROTECT cancels our bid at ask-price, the next requote fires when
+        # ask has ticked back up by one tick.  With a one-tick guard the
+        # strategy MODIFYs the bid right back to mkt_bid (= ask - 1 tick),
+        # and PROTECT fires again the next time the ask ticks down — an
+        # infinite loop.  A two-tick buffer keeps bid ≤ ask - 2 ticks, so a
+        # single-tick ask move toward us does NOT trigger PROTECT.
+        if bbo.ask_price is not None and bid_price >= bbo.ask_price - TICK_SIZE:
+            if self._verbose:
+                print(f"[GUARD] computed bid ${bid_price/PRICE_SCALE:.2f}"
+                      f" within 1 tick of bbo ask ${bbo.ask_price/PRICE_SCALE:.2f} — clamping")
+            bid_price = bbo.ask_price - 2 * TICK_SIZE  # two-tick clearance from ask
+        if bbo.bid_price is not None and ask_price <= bbo.bid_price + TICK_SIZE:
+            if self._verbose:
+                print(f"[GUARD] computed ask ${ask_price/PRICE_SCALE:.2f}"
+                      f" within 1 tick of bbo bid ${bbo.bid_price/PRICE_SCALE:.2f} — clamping")
+            ask_price = bbo.bid_price + 2 * TICK_SIZE  # two-tick clearance from bid
+
         with self._state_lock:
             inv = self._inventory
 
         quote_bid = True
         quote_ask = True
 
-        # Stop quoting the risk-increasing side at half max_inventory
-        half_max = self._max_inventory // 2
-        if inv >= half_max:
-            quote_bid = False       # don't buy more when already long
-        if inv <= -half_max:
-            quote_ask = False       # don't sell more when already short
+        # Hard stop at absolute inventory limits only.  The AS model's
+        # reservation-price skewing (r = s - q*gamma*sigma²*tau) already
+        # discourages fills on the high-inventory side by pushing quotes away
+        # from the market.  An earlier half-max cutoff caused the bid to
+        # disappear entirely from the book once inventory crossed 50% of the
+        # limit — the strategy appeared to "update" the quote (via [QUOTE]
+        # log) while nothing was actually in the exchange.
+        if inv >= self._max_inventory:
+            quote_bid = False       # don't buy more at absolute max inventory
+        if inv <= -self._max_inventory:
+            quote_ask = False       # don't sell more at absolute min inventory
 
         # Scale order size down as inventory grows (linear taper)
         inv_ratio = abs(inv) / max(self._max_inventory, 1)
@@ -452,37 +538,132 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
         bid_size = max(10, int(self._order_size * (size_scale if inv >= 0 else 1.0)))
         ask_size = max(10, int(self._order_size * (1.0 if inv >= 0 else size_scale)))
 
+        ltime = self._exchange_time if self._exchange_time != 0.0 else None
+
+        # --- Stale-modify detection and recovery ---
+        # When a MODIFY is sent the exchange must respond with MODIFY_ACK or
+        # REJECT within 2 seconds.  If it does not, pending_modify's property
+        # auto-clears silently, the next _update_quotes_locked sees the price
+        # is still wrong, and re-sends the SAME MODIFY to the SAME (stale)
+        # order ID — which again gets no response.  This loops forever: the
+        # bid price in the exchange never changes while the log shows
+        # continuous [SEND] modify activity.
+        #
+        # Fix: detect the timeout BEFORE the property clears the raw flag,
+        # cancel the unresponsive order, and let the normal CANCEL_ACK path
+        # resubmit a fresh quote at the correct price.
+        for _stale_order, _stale_tag in ((self._bid_order, 'BID'), (self._ask_order, 'ASK')):
+            if (_stale_order is not None
+                    and _stale_order.is_live
+                    and _stale_order._pending_modify       # raw flag before property clears it
+                    and time.time() - _stale_order._pending_modify_time
+                        > ManagedOrder._PENDING_TIMEOUT):
+                _elapsed = time.time() - _stale_order._pending_modify_time
+                print(f"[STALE] {_stale_tag} MODIFY not ACK'd in {_elapsed:.1f}s"
+                      f" (eid={_stale_order.exchange_order_id})"
+                      f" — cancelling to recover stuck quote")
+                # Clear the stale modify flag (cancel_order only checks
+                # is_live, not pending_modify, so this is safe).  Keep
+                # _bid/_ask_order pointing at the order so the pending_cancel
+                # guard below prevents a double-submit this cycle.  The
+                # CANCEL_ACK (or REJECT) will arrive via _on_fill, which
+                # sets _bid/_ask_order = None and kicks off a fresh requote.
+                _stale_order._pending_modify = False
+                if self._pending_modify_order is _stale_order:
+                    self._pending_modify_order = None
+                self.cancel_order(_stale_order, logical_time=ltime)
+
+        # --- Orphan detection ---
+        # If an order shows is_live=True but its exchange_order_id is no longer
+        # registered in the client's order table, the client and exchange have
+        # become desynchronised.  This can happen when:
+        #   - A MODIFY_ACK was lost / never arrived (pending_modify timed out),
+        #     but the exchange already replaced the order with a new ID.
+        #   - A CANCEL_ACK was lost, and the order expired on the exchange.
+        #   - A REJECT cleared pending_modify but the order was already gone.
+        # In any of these cases _bid_order.exchange_order_id is stale.  Any
+        # subsequent cancel or modify using that ID will be rejected, making the
+        # stuck quote permanent.  Detect this here and force the FSM into
+        # CANCELLED so the normal resubmit path takes over.
+        for _ref_attr in ('_bid_order', '_ask_order'):
+            _o = getattr(self, _ref_attr)
+            if _o is not None and _o.is_live and not _o.pending_modify and not _o.pending_cancel:
+                _oid = _o.exchange_order_id
+                if _oid is None or self.get_order(_oid) is not _o:
+                    # Order is live in FSM but not tracked in _orders — orphaned.
+                    if self._verbose:
+                        _side = "bid" if _ref_attr == '_bid_order' else "ask"
+                        print(f"[ORPHAN] {_side} order {_oid} not in order table "
+                              f"(is_live=True) — forcing CANCELLED to recover")
+                    try:
+                        _o._fsm.process_event(OrderEvent.CANCEL_ACK)
+                    except Exception:
+                        pass
+                    setattr(self, _ref_attr, None)
+
         # --- Bid side ---
         if self._bid_order is not None and self._bid_order.is_live:
             if not quote_bid:
-                self.cancel_order(self._bid_order)
+                if self._verbose:
+                    print(f"[SEND] cancel bid eid={self._bid_order.exchange_order_id}"
+                          f" (inv limit)")
+                self.cancel_order(self._bid_order, logical_time=ltime)
                 self._bid_order = None
+            elif self._bid_order.pending_cancel:
+                if self._verbose:
+                    print(f"[SKIP] bid eid={self._bid_order.exchange_order_id}"
+                          f" pending_cancel — waiting for CANCEL_ACK")
+                quote_bid = False
+            elif self._bid_order.pending_modify:
+                if self._verbose:
+                    print(f"[SKIP] bid eid={self._bid_order.exchange_order_id}"
+                          f" pending_modify — waiting for MODIFY_ACK")
+                quote_bid = False
             elif self._bid_order.price != bid_price or self._bid_order.size != bid_size:
-                # Atomic modify — no window for stale fills
+                if self._verbose:
+                    print(f"[SEND] modify bid eid={self._bid_order.exchange_order_id}"
+                          f" ${self._bid_order.price/PRICE_SCALE:.2f}"
+                          f" → ${bid_price/PRICE_SCALE:.2f}")
                 if not self.modify_order(self._bid_order, size=bid_size, price=bid_price,
-                                         user="client"):
-                    self._bid_order = None  # modify failed; re-submit below
+                                         user="client", logical_time=ltime):
+                    if self._verbose:
+                        print(f"[FAIL] modify_order returned False for bid"
+                              f" eid={self._bid_order.exchange_order_id}")
+                    self._bid_order = None
                 else:
-                    quote_bid = False   # modify sent; order still live
+                    quote_bid = False
             else:
                 quote_bid = False   # already correct
         if quote_bid and (self._bid_order is None or not self._bid_order.is_live):
             order = self.create_order("limit", bid_size, bid_price, "B",
                                       DEFAULT_TTL_SECONDS)
-            if self.submit_order_sync(order, timeout=2.0):
+            order.logical_time = ltime
+            if self._verbose:
+                print(f"[SEND] new bid ${bid_price/PRICE_SCALE:.2f} size={bid_size}")
+            if self.submit_order_sync(order, timeout=0.5):
+                if self._verbose:
+                    print(f"[ACK]  new bid eid={order.exchange_order_id}"
+                          f" ${bid_price/PRICE_SCALE:.2f}")
                 self._bid_order = order
             else:
+                if self._verbose:
+                    print(f"[TIMEOUT] new bid ${bid_price/PRICE_SCALE:.2f}"
+                          f" — no ACK within 0.5s")
                 self._bid_order = None
 
         # --- Ask side ---
         if self._ask_order is not None and self._ask_order.is_live:
             if not quote_ask:
-                self.cancel_order(self._ask_order)
+                self.cancel_order(self._ask_order, logical_time=ltime)
                 self._ask_order = None
+            elif self._ask_order.pending_cancel:
+                quote_ask = False   # cancel in-flight; wait for CANCEL_ACK
+            elif self._ask_order.pending_modify:
+                quote_ask = False   # modify in-flight; wait for MODIFY_ACK before sending another
             elif self._ask_order.price != ask_price or self._ask_order.size != ask_size:
                 # Atomic modify — no window for stale fills
                 if not self.modify_order(self._ask_order, size=ask_size, price=ask_price,
-                                         user="client"):
+                                         user="client", logical_time=ltime):
                     self._ask_order = None  # modify failed; re-submit below
                 else:
                     quote_ask = False   # modify sent; order still live
@@ -491,7 +672,8 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
         if quote_ask and (self._ask_order is None or not self._ask_order.is_live):
             order = self.create_order("limit", ask_size, ask_price, "S",
                                       DEFAULT_TTL_SECONDS)
-            if self.submit_order_sync(order, timeout=2.0):
+            order.logical_time = ltime
+            if self.submit_order_sync(order, timeout=0.5):
                 self._ask_order = order
             else:
                 self._ask_order = None
@@ -514,6 +696,96 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
     # ------------------------------------------------------------------
 
     def _on_fill(self, order: ManagedOrder, msg: ExchangeMessage) -> None:
+        if self._verbose:
+            side = "BID" if order.side == 'B' else "ASK"
+            eid = order.exchange_order_id
+            price = order.price / PRICE_SCALE if order.price else 0
+            is_bid = (order is self._bid_order)
+            is_ask = (order is self._ask_order)
+            tracked = "bid_order" if is_bid else ("ask_order" if is_ask else "untracked")
+            print(f"[RECV] {msg.msg_type} for {side} eid={eid} price=${price:.2f} "
+                  f"({tracked}) is_live={order.is_live}")
+        if msg.msg_type in ("CANCEL_ACK", "EXPIRED"):
+            # Order removed from book; bypass rate limiter.
+            self._last_requote_time = 0
+            # For CANCEL_ACK: the exchange broadcasts the UDP DELETE *before*
+            # sending the TCP CANCEL_ACK, so the BBO-change event has already
+            # fired (with pending_cancel=True) and was correctly skipped.
+            # For EXPIRED: the exchange broadcasts the UDP DELETE via the TTL
+            # checker thread, so the BBO-change event may also have already
+            # fired.
+            # In both cases, without a subsequent market-data event there is
+            # nothing to trigger the resubmission, leaving the strategy with
+            # no live quote.  Fix: kick off a requote from a new thread.  We
+            # must not call _update_quotes directly here (receive thread)
+            # because submit_order_sync would deadlock waiting on _pending_event.
+            if time.time() - self._t0 >= self._warmup:
+                def _do_requote():
+                    self._update_quotes(self.get_bbo())
+                threading.Thread(
+                    target=_do_requote,
+                    daemon=True, name="requote-after-cancel",
+                ).start()
+            return
+
+        if msg.msg_type == "REJECT":
+            # A REJECT was attributed to this order's in-flight modify or cancel
+            # by _process_message (which already cleared pending_modify /
+            # pending_cancel on the order).  We still need to decide what to do:
+            #
+            # - Modify REJECT: the exchange rejected the cancel-replace because
+            #   the order ID was not found.  Two sub-cases:
+            #   (a) The order was already cancelled/filled on the exchange before
+            #       our modify arrived.  The FSM still shows is_live=True but the
+            #       order is dead.  Forcibly mark it as dead client-side so the
+            #       strategy can resubmit.
+            #   (b) The order genuinely exists but we sent the wrong ID (bug).
+            #       Treat the same way — mark dead and resubmit.
+            #
+            # - Cancel REJECT: the order is still live on the exchange (cancel
+            #   was rejected).  No special action needed; the strategy will
+            #   retry on the next BBO change.
+            #
+            # We distinguish the two cases via order.is_live: if is_live is
+            # still True after the REJECT is processed, the FSM thinks the order
+            # is alive.  Whether the reject was for a modify or cancel we check
+            # by looking at which pending flag was cleared.  The _pending_modify
+            # flag was already cleared by _process_message before calling here;
+            # _pending_cancel likewise.
+            #
+            # Strategy: if the order has is_live=True after a REJECT, check
+            # whether its exchange_order_id is still registered in self._orders.
+            # If not, the order has been orphaned — mark it dead and kick a
+            # requote thread.
+            if order.is_live:
+                oid = order.exchange_order_id
+                order_still_tracked = (oid is not None and self.get_order(oid) is order)
+                if not order_still_tracked:
+                    # The order is no longer tracked (already removed from
+                    # _orders, e.g. filled or cancelled via another path).
+                    # Force the FSM into CANCELLED so is_live becomes False
+                    # and the strategy stops trying to modify/cancel it.
+                    try:
+                        order._fsm.process_event(OrderEvent.CANCEL_ACK)
+                    except Exception:
+                        pass
+                    if self._verbose:
+                        side_str = "bid" if order.side == 'B' else "ask"
+                        print(f"[REJECT-RECOVER] {side_str} order {oid} orphaned "
+                              f"after REJECT — forcing CANCELLED, will resubmit")
+                    if time.time() - self._t0 >= self._warmup:
+                        def _do_requote_reject():
+                            self._update_quotes(self.get_bbo())
+                        threading.Thread(
+                            target=_do_requote_reject,
+                            daemon=True, name="requote-after-reject",
+                        ).start()
+                else:
+                    # Order is still tracked and alive; just kick a fresh
+                    # requote so PROTECT / normal requote logic re-evaluates.
+                    self._last_requote_time = 0
+            return
+
         if msg.msg_type not in ("FILL", "PARTIAL_FILL"):
             return
         if msg.size is None or msg.price is None:
@@ -521,6 +793,10 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
 
         fill_size = msg.size
         fill_price_d = msg.price / PRICE_SCALE
+
+        # Keep order._size current so the lone-quote BBO check stays accurate
+        if msg.msg_type == "PARTIAL_FILL" and msg.remainder_size is not None:
+            order._size = msg.remainder_size
 
         with self._state_lock:
             if order.side == 'B':
@@ -647,8 +923,11 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
                             sigma = self._sigma
                             k_now = self._k
                         pnl = cash + inv * mid_d
-                        elapsed = now - self._session_start
-                        tau = max(self._horizon - elapsed, 0)
+                        if self._tau_fixed is not None:
+                            tau = self._tau_fixed
+                        else:
+                            elapsed = now - self._session_start
+                            tau = max(self._horizon - elapsed, 0)
                         alpha_total = sum(sig.alpha() for sig in self._signals)
                         alpha_str = f"  alpha=${alpha_total:.6f}" if self._signals else ""
                         k_str = f"  k={k_now:.1f}" if self._k_auto else ""
@@ -662,11 +941,12 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
 
             # Cancel outstanding orders to prevent fill flood during shutdown
             self.set_message_callback(None)
+            ltime = self._exchange_time if self._exchange_time != 0.0 else None
             if self._bid_order and self._bid_order.is_live:
-                self.cancel_order(self._bid_order)
+                self.cancel_order(self._bid_order, logical_time=ltime)
                 self._bid_order = None
             if self._ask_order and self._ask_order.is_live:
-                self.cancel_order(self._ask_order)
+                self.cancel_order(self._ask_order, logical_time=ltime)
                 self._ask_order = None
             time.sleep(0.2)  # let cancels process
 
@@ -768,10 +1048,12 @@ def plot_results(snapshots: List[Snapshot], fills: List[FillRecord],
     sell_fills = [f for f in fills if f.side == 'S']
     if buy_fills:
         ax.plot([f.t for f in buy_fills], [f.price for f in buy_fills],
-                '^', markersize=5, color='green', label='Buy fill')
+                'x', markersize=10, color='green', markeredgewidth=2.5,
+                zorder=5, label='Buy fill')
     if sell_fills:
         ax.plot([f.t for f in sell_fills], [f.price for f in sell_fills],
-                'v', markersize=5, color='red', label='Sell fill')
+                'x', markersize=10, color='red', markeredgewidth=2.5,
+                zorder=5, label='Sell fill')
 
     ax.set_ylabel('Price ($)')
     ax.set_title('Avellaneda-Stoikov Market Maker')
@@ -827,7 +1109,7 @@ def main():
     parser.add_argument('--md-port', type=int, default=10002)
     parser.add_argument('--gamma', type=float, default=0.01,
                         help='Risk aversion parameter (default: 0.01)')
-    parser.add_argument('--k', type=float, default=20.0,
+    parser.add_argument('--k-fixed', type=float, default=20.0,
                         help='Order arrival intensity κ.  The liquidity term of the '
                              'spread is ≈2/κ, so κ directly sets your minimum quote '
                              'width.  Illiquid instruments need κ~20; highly liquid '
@@ -842,6 +1124,10 @@ def main():
                              'from widening excessively before k-auto converges.')
     parser.add_argument('--horizon', type=float, default=300.0,
                         help='Time horizon T in seconds (default: 300)')
+    parser.add_argument('--tau-fixed', type=float, default=None, metavar='SECONDS',
+                        help='Pin τ=(T-t) to a fixed value instead of letting it decay. '
+                             'Makes the model stationary: spreads and inventory adjustments '
+                             'are constant through time. --horizon is ignored when set.')
     parser.add_argument('--sigma-window', type=int, default=100,
                         help='Mid-price observations for volatility (default: 100)')
     parser.add_argument('--max-inventory', type=int, default=500,
@@ -895,10 +1181,11 @@ def main():
         order_port=args.order_port,
         md_port=args.md_port,
         gamma=args.gamma,
-        k=args.k,
+        k=args.k_fixed,
         k_auto=args.k_auto,
         k_min=args.k_min,
         horizon=args.horizon,
+        tau_fixed=args.tau_fixed,
         sigma_window=args.sigma_window,
         max_inventory=args.max_inventory,
         order_size=args.order_size,

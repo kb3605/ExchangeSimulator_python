@@ -242,7 +242,7 @@ class LiquidityProvider:
         bid = self._book_builder.book.get_best_bid_price()
         ask = self._book_builder.book.get_best_ask_price()
         if bid and ask:
-            raw = (bid + ask + TICK_SIZE) // 2   # ceiling → symmetric for odd-tick spreads
+            raw = (bid + ask) // 2               # true mid, round down to nearest tick
             return (raw // TICK_SIZE) * TICK_SIZE
         return self._bootstrap_mid
 
@@ -301,7 +301,21 @@ class LiquidityProvider:
         size = sample_order_size()
         delta_price = delta_ticks * TICK_SIZE
         ttl = order_ttl(delta_ticks)
-        mid = self._get_mid()
+
+        bid = self._book_builder.book.get_best_bid_price()
+        ask = self._book_builder.book.get_best_ask_price()
+
+        if bid and ask:
+            raw_half = (bid + ask) // 2
+            # For odd-tick spreads the true mid falls between ticks.
+            # Randomly round up or down so aggressive orders (delta=0) are
+            # equally likely to be buys or sells — no systematic drift.
+            if (bid + ask) % (2 * TICK_SIZE) != 0 and random.random() < 0.5:
+                mid = ((raw_half // TICK_SIZE) + 1) * TICK_SIZE  # ceil
+            else:
+                mid = (raw_half // TICK_SIZE) * TICK_SIZE         # floor
+        else:
+            mid = self._get_mid()
 
         if side == 'B':
             price = mid - delta_price

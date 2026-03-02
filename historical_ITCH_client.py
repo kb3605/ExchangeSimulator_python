@@ -393,7 +393,7 @@ class HistoricalITCHClient:
     def process_add(self, row) -> bool:
         """Handle /A and /F  — submit a limit order and track it."""
         side = 'B' if row.side == 1 else 'S'
-        order_str = f"limit,{row.shares},{row.price},{side},{_USER},{_ORDER_TTL}"
+        order_str = f"limit,{row.shares},{row.price},{side},{_USER},{_ORDER_TTL},{row.timestamp_s}"
         response = self._send_and_receive(order_str)
 
         exchange_id, was_fill = self._parse_ack(response)
@@ -419,7 +419,7 @@ class HistoricalITCHClient:
             return False
 
         exchange_id, _, _, _ = self._order_map[row.order_ref]
-        cancel_str = f"cancel,{exchange_id},{_USER}"
+        cancel_str = f"cancel,{exchange_id},{_USER},{row.timestamp_s}"
         response = self._send_and_receive(cancel_str)
 
         del self._order_map[row.order_ref]
@@ -452,7 +452,7 @@ class HistoricalITCHClient:
 
         if row.printable:
             aggressor_side = 'S' if side == 'B' else 'B'
-            market_str = f"market,{row.shares},0,{aggressor_side},{_USER}"
+            market_str = f"market,{row.shares},0,{aggressor_side},{_USER},0,{row.timestamp_s}"
             response = self._send_and_receive(market_str)
 
             if 'REJECT' in response:
@@ -461,13 +461,13 @@ class HistoricalITCHClient:
                 self.errors += 1
                 self.execute_errors += 1
                 self._shrink_or_remove(row.order_ref, exchange_id, old_size,
-                                       price, side, row.shares)
+                                       price, side, row.shares, row.timestamp_s)
                 return False
 
             self.market_orders_sent += 1
 
         self._shrink_or_remove(row.order_ref, exchange_id, old_size,
-                               price, side, row.shares)
+                               price, side, row.shares, row.timestamp_s)
         return True
 
     def process_noncross_trade(self, row) -> bool:
@@ -485,7 +485,7 @@ class HistoricalITCHClient:
         visible book is left unchanged on net.
         """
         # Place a synthetic SELL at the trade price
-        sell_str = f"limit,{row.shares},{row.price},S,{_USER},2"  # TTL=2s
+        sell_str = f"limit,{row.shares},{row.price},S,{_USER},2,{row.timestamp_s}"  # TTL=2s
         sell_resp = self._send_and_receive(sell_str)
         sell_id, sell_filled = self._parse_ack(sell_resp)
 
@@ -503,14 +503,14 @@ class HistoricalITCHClient:
             return True
 
         # SELL is resting — consume it with a market BUY
-        buy_str = f"market,{row.shares},0,B,{_USER}"
+        buy_str = f"market,{row.shares},0,B,{_USER},0,{row.timestamp_s}"
         buy_resp = self._send_and_receive(buy_str)
 
         if 'REJECT' not in buy_resp:
             self.market_orders_sent += 1
 
         # Cancel any unfilled remainder of the synthetic SELL
-        cancel_str = f"cancel,{sell_id},{_USER}"
+        cancel_str = f"cancel,{sell_id},{_USER},{row.timestamp_s}"
         cancel_resp = self._send_and_receive(cancel_str)
         if cancel_resp.startswith('CANCEL_ACK'):
             self.cancels_sent += 1
@@ -519,10 +519,10 @@ class HistoricalITCHClient:
 
     def _shrink_or_remove(self, order_ref: int, exchange_id: int,
                           old_size: int, price: int, side: str,
-                          executed: int) -> None:
+                          executed: int, timestamp_s: float = 0.0) -> None:
         """Cancel the resting order; resubmit if there is a remaining quantity."""
         new_size = old_size - executed
-        cancel_str = f"cancel,{exchange_id},{_USER}"
+        cancel_str = f"cancel,{exchange_id},{_USER},{timestamp_s}"
         resp = self._send_and_receive(cancel_str)
 
         if 'CANCEL_ACK' not in resp:
@@ -535,7 +535,7 @@ class HistoricalITCHClient:
         self.cancels_sent += 1
 
         if new_size > 0:
-            order_str = f"limit,{new_size},{price},{side},{_USER},{_ORDER_TTL}"
+            order_str = f"limit,{new_size},{price},{side},{_USER},{_ORDER_TTL},{timestamp_s}"
             resp2 = self._send_and_receive(order_str)
             new_id, was_fill = self._parse_ack(resp2)
             if new_id is not None:
@@ -562,7 +562,7 @@ class HistoricalITCHClient:
             return False
 
         exchange_id, old_size, price, side = self._order_map[row.order_ref]
-        cancel_str = f"cancel,{exchange_id},{_USER}"
+        cancel_str = f"cancel,{exchange_id},{_USER},{row.timestamp_s}"
         response = self._send_and_receive(cancel_str)
 
         if not response.startswith('CANCEL_ACK'):
@@ -577,7 +577,7 @@ class HistoricalITCHClient:
         new_size = old_size - row.shares
 
         if new_size > 0:
-            order_str = f"limit,{new_size},{price},{side},{_USER},{_ORDER_TTL}"
+            order_str = f"limit,{new_size},{price},{side},{_USER},{_ORDER_TTL},{row.timestamp_s}"
             response = self._send_and_receive(order_str)
             new_id, was_fill = self._parse_ack(response)
             if new_id is not None:
@@ -608,7 +608,7 @@ class HistoricalITCHClient:
 
         exchange_id, _, _, side = self._order_map[row.order_ref]
 
-        cancel_str = f"cancel,{exchange_id},{_USER}"
+        cancel_str = f"cancel,{exchange_id},{_USER},{row.timestamp_s}"
         response = self._send_and_receive(cancel_str)
         del self._order_map[row.order_ref]
 
@@ -621,7 +621,7 @@ class HistoricalITCHClient:
 
         self.cancels_sent += 1
 
-        order_str = f"limit,{row.shares},{row.price},{side},{_USER},{_ORDER_TTL}"
+        order_str = f"limit,{row.shares},{row.price},{side},{_USER},{_ORDER_TTL},{row.timestamp_s}"
         response = self._send_and_receive(order_str)
         new_id, was_fill = self._parse_ack(response)
 

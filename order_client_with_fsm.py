@@ -190,12 +190,19 @@ class ManagedOrder:
         self._order_type = order_type
         self._ttl = ttl
         self._last_message: Optional[ExchangeMessage] = None
+        self.logical_time: Optional[float] = None  # Historical exchange timestamp for UDP broadcasts
+        self._pending_modify: bool = False  # True while a modify is in-flight (awaiting MODIFY_ACK)
+        self._pending_cancel: bool = False  # True while a cancel is in-flight (awaiting CANCEL_ACK)
+        self._pending_modify_time: float = 0.0
+        self._pending_cancel_time: float = 0.0
 
     def process_message(self, msg: ExchangeMessage) -> bool:
         """
         Process an exchange message. FSM handles all state transition logic.
         """
         self._last_message = msg
+        if msg.msg_type == "CANCEL_ACK":
+            self._pending_cancel = False
         return self._fsm.process_exchange_message(msg)
 
     def submit(self) -> bool:
@@ -257,6 +264,22 @@ class ManagedOrder:
     def exchange_order_id(self) -> Optional[int]:
         return self._fsm.exchange_order_id
 
+    _PENDING_TIMEOUT = 2.0  # seconds before treating an un-acked request as lost
+
+    @property
+    def pending_modify(self) -> bool:
+        """True while a modify is in-flight, with a 2s timeout to clear a lost MODIFY_ACK."""
+        if self._pending_modify and time.time() - self._pending_modify_time > self._PENDING_TIMEOUT:
+            self._pending_modify = False
+        return self._pending_modify
+
+    @property
+    def pending_cancel(self) -> bool:
+        """True while a cancel is in-flight, with a 2s timeout to clear a lost CANCEL_ACK."""
+        if self._pending_cancel and time.time() - self._pending_cancel_time > self._PENDING_TIMEOUT:
+            self._pending_cancel = False
+        return self._pending_cancel
+
     @property
     def size(self) -> int:
         return self._size
@@ -288,9 +311,12 @@ class ManagedOrder:
     def to_order_string(self) -> str:
         """Generate the wire format order string."""
         if self._order_type == "limit":
-            return f"limit,{self._size},{self._price},{self._side},client,{self._ttl}"
+            base = f"limit,{self._size},{self._price},{self._side},client,{self._ttl}"
         else:
-            return f"market,{self._size},0,{self._side},client"
+            base = f"market,{self._size},0,{self._side},client"
+        if self.logical_time is not None:
+            base += f",{self.logical_time}"
+        return base
 
     def __repr__(self) -> str:
         return (f"ManagedOrder(state={self.state_name}, "
@@ -320,6 +346,13 @@ class OrderClientWithFSM:
         self._pending_order: Optional[ManagedOrder] = None
         self._pending_event: threading.Event = threading.Event()
         self._message_callback: Optional[Callable[[ManagedOrder, ExchangeMessage], None]] = None
+
+        # Track which order has an in-flight modify or cancel so that a REJECT
+        # (which carries no order_id) can be attributed to the right order and
+        # clear its pending_modify / pending_cancel flag immediately rather than
+        # waiting for the 2-second timeout.
+        self._pending_modify_order: Optional[ManagedOrder] = None
+        self._pending_cancel_order: Optional[ManagedOrder] = None
 
     def connect(self) -> bool:
         """Connect to the exchange."""
@@ -380,7 +413,7 @@ class OrderClientWithFSM:
         except Exception:
             return False
 
-    def submit_order_sync(self, order: ManagedOrder, timeout: float = 5.0) -> bool:
+    def submit_order_sync(self, order: ManagedOrder, timeout: float = 0.5) -> bool:
         """Submit order and wait for initial response.
 
         If the async receive thread is running, this waits for it to process
@@ -417,20 +450,33 @@ class OrderClientWithFSM:
         except Exception:
             return False
 
-    def cancel_order(self, order: ManagedOrder, user: str = "client") -> bool:
+    def cancel_order(self, order: ManagedOrder, user: str = "client",
+                     logical_time: Optional[float] = None) -> bool:
         """Send cancel request for a managed order."""
         if order.exchange_order_id is None or not order.is_live or not self._socket:
             return False
 
         try:
-            cancel_str = f"cancel,{order.exchange_order_id},{user}\n"
+            ts_suffix = f",{logical_time}" if logical_time is not None else ""
+            cancel_str = f"cancel,{order.exchange_order_id},{user}{ts_suffix}\n"
+            # Set flag BEFORE sendall: on loopback the CANCEL_ACK can arrive and
+            # be processed by the receive thread before the next Python bytecode
+            # executes, so setting the flag after sendall races with the clear in
+            # process_message and leaves _pending_cancel stuck True for 2 seconds.
+            order._pending_cancel = True
+            order._pending_cancel_time = time.time()
+            # Record which order has a cancel in-flight so an unrouted REJECT
+            # (no order_id) can be attributed back to this order.
+            self._pending_cancel_order = order
             self._socket.sendall(cancel_str.encode('utf-8'))
             return True
         except Exception:
+            order._pending_cancel = False  # send failed — no cancel in-flight
+            self._pending_cancel_order = None
             return False
 
     def modify_order(self, order: ManagedOrder, size: int = 0, price: int = 0,
-                     user: str = "client") -> bool:
+                     user: str = "client", logical_time: Optional[float] = None) -> bool:
         """
         Send modify request for a managed order (cancel-replace).
 
@@ -450,10 +496,22 @@ class OrderClientWithFSM:
         new_price = price if price > 0 else order.price
 
         try:
-            modify_str = f"modify,{order.exchange_order_id},{new_size},{new_price},{user}\n"
+            ts_suffix = f",{logical_time}" if logical_time is not None else ""
+            modify_str = f"modify,{order.exchange_order_id},{new_size},{new_price},{user}{ts_suffix}\n"
+            # Set flag BEFORE sendall: on loopback the MODIFY_ACK can arrive and
+            # be processed by the receive thread before the next Python bytecode
+            # executes, so setting the flag after sendall races with the clear in
+            # _process_message and leaves _pending_modify stuck True for 2 seconds.
+            order._pending_modify = True
+            order._pending_modify_time = time.time()
+            # Record which order has a modify in-flight so an unrouted REJECT
+            # (no order_id) can be attributed back to this order.
+            self._pending_modify_order = order
             self._socket.sendall(modify_str.encode('utf-8'))
             return True
         except Exception:
+            order._pending_modify = False  # send failed — no modify in-flight
+            self._pending_modify_order = None
             return False
 
     def get_order(self, exchange_order_id: int) -> Optional[ManagedOrder]:
@@ -507,6 +565,8 @@ class OrderClientWithFSM:
             return
 
         order: Optional[ManagedOrder] = None
+        reject_order: Optional[ManagedOrder] = None
+        _ghost_id_to_cancel: Optional[int] = None  # set if a ghost order is detected
 
         with self._orders_lock:
             # Handle MODIFY_ACK: re-map order from old_id to new_id
@@ -522,12 +582,75 @@ class OrderClientWithFSM:
                     order._fsm._exchange_order_id = new_id
                     order._size = msg.size
                     order._price = msg.price
+                    order._pending_modify = False
+                    # Clear the global pending-modify tracker now that the ACK
+                    # has been received and attributed to this order.
+                    if self._pending_modify_order is order:
+                        self._pending_modify_order = None
+                    # Ghost-order detection: if the order was already filled or
+                    # cancelled before this MODIFY_ACK arrived, the exchange has
+                    # just created a new live order (new_id) that the application
+                    # no longer has a handle to.  It will sit unmanaged in the
+                    # book at a fixed price until its TTL expires.  Flag it here
+                    # (inside the lock) so we can cancel it outside the lock.
+                    if not order.is_live:
+                        _ghost_id_to_cancel = new_id
+                        logging.warning(
+                            f"[GHOST] MODIFY_ACK for dead order old_id={old_id} "
+                            f"→ new_id={new_id} price=${msg.price/10000:.2f}: "
+                            "order was filled/cancelled before MODIFY_ACK arrived; "
+                            "exchange created a new untracked order — will cancel it"
+                        )
+                else:
+                    # MODIFY_ACK arrived for an old_id that is no longer in
+                    # _orders.  This can happen when:
+                    #   (a) the order was already cancelled or filled before the
+                    #       MODIFY_ACK arrived (race condition), or
+                    #   (b) a previous re-mapping already moved the entry to
+                    #       new_id and _pending_modify_order is still set.
+                    # In all cases, clear the in-flight flag on whatever order
+                    # we thought was pending a modify so the strategy can act.
+                    if self._pending_modify_order is not None:
+                        self._pending_modify_order._pending_modify = False
+                        self._pending_modify_order = None
+
+            # Handle REJECT: attribute to the order that has a pending modify or
+            # cancel in-flight.  REJECT carries no order_id, so we use the
+            # client-side tracker set in modify_order() / cancel_order().
+            # Priority: prefer pending_modify because a modify REJECT means the
+            # original order is still alive and the strategy must decide whether
+            # to retry; a cancel REJECT is rarer and also self-resolves (order
+            # stays live).
+            elif msg.msg_type == "REJECT":
+                if self._pending_modify_order is not None:
+                    reject_order = self._pending_modify_order
+                    reject_order._pending_modify = False
+                    self._pending_modify_order = None
+                elif self._pending_cancel_order is not None:
+                    reject_order = self._pending_cancel_order
+                    reject_order._pending_cancel = False
+                    self._pending_cancel_order = None
+                # If neither modify/cancel tracker is set, the REJECT is for a
+                # new-order submission.  On TCP all prior cancel/modify responses
+                # arrive before the new-order response (messages are ordered), so
+                # by the time we reach here both trackers are already cleared.
+                # Route the REJECT to the pending order so submit_order_sync
+                # can return immediately instead of waiting for its timeout.
+                elif self._pending_order is not None:
+                    order = self._pending_order
+                    self._pending_order = None
+                    self._pending_event.set()
 
             # FIRST: Check if this message is for an existing order (passive fill)
             # This must be checked before pending_order to avoid confusing passive
             # fills with responses to new orders.
             elif msg.order_id is not None and msg.order_id in self._orders:
                 order = self._orders[msg.order_id]
+                # Also clear the CANCEL_ACK tracker when we route via order_id
+                # (the main clear path is in order.process_message below, but
+                # clear the client-level tracker here).
+                if msg.msg_type == "CANCEL_ACK" and self._pending_cancel_order is order:
+                    self._pending_cancel_order = None
 
             # SECOND: Handle responses to pending orders (new order submissions)
             elif msg.msg_type == "ACK" and self._pending_order is not None:
@@ -536,11 +659,6 @@ class OrderClientWithFSM:
                 self._pending_event.set()
                 if msg.order_id is not None:
                     self._orders[msg.order_id] = order
-
-            elif msg.msg_type == "REJECT" and self._pending_order is not None:
-                order = self._pending_order
-                self._pending_order = None
-                self._pending_event.set()
 
             elif msg.msg_type == "FILL" and self._pending_order is not None:
                 # Immediate full fill for pending order (crossing order)
@@ -572,10 +690,26 @@ class OrderClientWithFSM:
                     price=msg.price
                 ))
 
+        # Cancel any ghost order detected inside the lock.  Must send outside
+        # the lock to avoid holding it during socket I/O.
+        if _ghost_id_to_cancel is not None and self._socket:
+            try:
+                self._socket.sendall(
+                    f"cancel,{_ghost_id_to_cancel},client\n".encode('utf-8')
+                )
+            except OSError as e:
+                logging.error(f"[GHOST] Failed to cancel ghost order {_ghost_id_to_cancel}: {e}")
+
         if order is not None:
             order.process_message(msg)
             if self._message_callback:
                 self._message_callback(order, msg)
+
+        # Fire the callback for REJECTs attributed to modify/cancel orders.
+        # This gives the strategy layer (e.g. AvellanedaStoikov._on_fill) a
+        # chance to react — e.g. force-resubmit after a modify REJECT.
+        if reject_order is not None and self._message_callback:
+            self._message_callback(reject_order, msg)
 
 
 # --- Main / Demo ---
